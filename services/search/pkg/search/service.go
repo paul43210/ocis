@@ -79,6 +79,11 @@ type Service struct {
 	// maxConsecutiveFailures aborts an IndexSpace walk after this many
 	// consecutive extraction failures. 0 disables the abort.
 	maxConsecutiveFailures int
+	// failedRetryInterval is how long an IndexSpace walk leaves an unchanged
+	// file alone after its extraction failed. 0 retries it on every walk.
+	failedRetryInterval time.Duration
+	// now returns the current time; tests replace it.
+	now func() time.Time
 }
 
 var errSkipSpace error
@@ -103,6 +108,8 @@ func NewService(gatewaySelector pool.Selectable[gateway.GatewayAPIClient], eng e
 		serviceAccountSecret: cfg.ServiceAccount.ServiceAccountSecret,
 
 		maxConsecutiveFailures: cfg.Extractor.MaxConsecutiveFailures,
+		failedRetryInterval:    cfg.Extractor.FailedRetryInterval,
+		now:                    time.Now,
 	}
 
 	return s
@@ -550,6 +557,14 @@ func (s *Service) IndexSpace(ctx context.Context, spaceID *provider.StorageSpace
 				return nil
 			}
 		}
+		if err == nil && s.failedEarlierAndUnchanged(r, info) {
+			// Extracting it again would most likely fail the same way, and a
+			// file that times out the extractor costs minutes on every walk.
+			// It neither counts towards nor resets the abort threshold.
+			s.logger.Debug().Str("path", ref.Path).Str("failed_at", r.ExtractionFailedAt).
+				Msg("extraction failed earlier and the file hasn't changed. Skipping.")
+			return nil
+		}
 
 		if err := s.upsertItem(ownerCtx, ref, _extractionRetries); err != nil {
 			if errors.Is(err, errResourceNotFound) {
@@ -647,26 +662,13 @@ func (s *Service) upsertItem(ctx context.Context, ref *provider.Reference, retri
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("extraction failed for %s: %w", ref.Path, err)
+		err = fmt.Errorf("extraction failed for %s: %w", ref.Path, err)
+		s.recordFailedExtraction(ctx, resourceID, path, stat.GetInfo())
+		return err
 	}
 
-	r := engine.Resource{
-		ID: resourceID,
-		RootID: storagespace.FormatResourceID(&provider.ResourceId{
-			StorageId: stat.Info.Id.StorageId,
-			OpaqueId:  stat.Info.Id.SpaceId,
-			SpaceId:   stat.Info.Id.SpaceId,
-		}),
-		Path:      utils.MakeRelativePath(path),
-		Type:      uint64(stat.Info.Type),
-		Document:  doc,
-		Extracted: true,
-	}
-	r.Hidden = strings.HasPrefix(r.Path, ".")
-
-	if parentID := stat.GetInfo().GetParentId(); parentID != nil {
-		r.ParentID = storagespace.FormatResourceID(parentID)
-	}
+	r := newResource(resourceID, path, stat.GetInfo(), doc)
+	r.Extracted = true
 
 	if err = s.engine.Upsert(r.ID, r); err != nil {
 		return fmt.Errorf("index upsert for %s: %w", ref.Path, err)
@@ -675,6 +677,76 @@ func (s *Service) upsertItem(ctx context.Context, ref *provider.Reference, retri
 	logDocCount(s.engine, s.logger)
 	s.storeExtractedMetadata(ctx2, ref, doc)
 	return nil
+}
+
+// newResource builds the index entry for a resource from its stat info and
+// extracted document.
+func newResource(resourceID, path string, info *provider.ResourceInfo, doc content.Document) engine.Resource {
+	r := engine.Resource{
+		ID: resourceID,
+		RootID: storagespace.FormatResourceID(&provider.ResourceId{
+			StorageId: info.GetId().GetStorageId(),
+			OpaqueId:  info.GetId().GetSpaceId(),
+			SpaceId:   info.GetId().GetSpaceId(),
+		}),
+		Path:     utils.MakeRelativePath(path),
+		Type:     uint64(info.GetType()), //nolint:gosec // a resource type is a small non-negative enum value
+		Document: doc,
+	}
+	r.Hidden = strings.HasPrefix(r.Path, ".")
+
+	if parentID := info.GetParentId(); parentID != nil {
+		r.ParentID = storagespace.FormatResourceID(parentID)
+	}
+	return r
+}
+
+// recordFailedExtraction indexes a file whose content extraction failed by its
+// name and metadata only, and notes when that happened, so that IndexSpace
+// can leave it alone until it changes or failedRetryInterval has passed. It
+// does nothing when failedRetryInterval is 0, or when the extraction was cut
+// short by the context ending, which says nothing about the file.
+func (s *Service) recordFailedExtraction(ctx context.Context, resourceID, path string, info *provider.ResourceInfo) {
+	if s.failedRetryInterval <= 0 || ctx.Err() != nil {
+		return
+	}
+
+	// Basic extraction only reads the stat info, so it cannot fail like the
+	// content extraction did.
+	basic, err := content.NewBasicExtractor(s.logger)
+	if err == nil {
+		var doc content.Document
+		doc, err = basic.Extract(ctx, info)
+		if err == nil {
+			r := newResource(resourceID, path, info, doc)
+			r.ExtractionFailedAt = s.now().UTC().Format(time.RFC3339Nano)
+			err = s.engine.Upsert(r.ID, r)
+		}
+	}
+	if err != nil {
+		s.logger.Error().Err(err).Str("path", path).Msg("could not record the failed extraction in the index")
+	}
+}
+
+// failedEarlierAndUnchanged reports whether the indexed resource r records a
+// failed extraction that is younger than failedRetryInterval, for a file that
+// has not changed since.
+func (s *Service) failedEarlierAndUnchanged(r *engine.Resource, info *provider.ResourceInfo) bool {
+	if s.failedRetryInterval <= 0 || r == nil || r.Extracted || r.ExtractionFailedAt == "" {
+		return false
+	}
+	if info.GetType() != provider.ResourceType_RESOURCE_TYPE_FILE {
+		return false
+	}
+	failedAt, err := time.Parse(time.RFC3339Nano, r.ExtractionFailedAt)
+	if err != nil || s.now().Sub(failedAt) >= s.failedRetryInterval {
+		return false
+	}
+	docMtime, err := time.Parse(time.RFC3339Nano, r.Mtime)
+	if err != nil || docMtime.Before(utils.TSToTime(info.GetMtime())) {
+		return false
+	}
+	return true
 }
 
 // storeExtractedMetadata persists Tika-extracted audio, image, location, and

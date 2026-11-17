@@ -9,3 +9,8 @@ func SetExtractionRetryDelay(d time.Duration) func() {
 	_extractionRetryDelay = d
 	return func() { _extractionRetryDelay = prev }
 }
+
+// SetNow replaces the clock the service uses to date failed extractions.
+func (s *Service) SetNow(now func() time.Time) {
+	s.now = now
+}
