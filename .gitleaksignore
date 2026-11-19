@@ -1,0 +1,2 @@
+# Upstream test fixture (a56e2fae6f, #12719): Keycloak role UUIDs in ownCloud acceptance tests, public, not secrets.
+a56e2fae6f21bd87aa68ea7f9398aa9303cecf1b:tests/acceptance/TestHelpers/KeycloakHelper.php:generic-api-key:46
